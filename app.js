@@ -183,6 +183,42 @@ const api = {
   async setImage(product, url) {
     if (url && !product.image_url) await q(sb.from('products').update({ image_url: url }).eq('id', product.id));
   },
+  // ---- Einkaufsliste ----
+  async addToList(product, name, user, qty = 1) {
+    let qb = sb.from('shopping_items').select('id,qty').eq('done', false);
+    qb = product ? qb.eq('product_id', product.id) : qb.is('product_id', null).ilike('name', name);
+    const rows = await q(qb.limit(1));
+    if (rows[0]) {
+      await q(sb.from('shopping_items').update({ qty: rows[0].qty + qty }).eq('id', rows[0].id));
+      return rows[0].qty + qty;
+    }
+    await q(sb.from('shopping_items').insert({
+      product_id: product ? product.id : null, name: product ? product.name : name, qty, added_by: user
+    }));
+    return qty;
+  },
+  async setListQty(it, qty) {
+    if (qty >= 1) await q(sb.from('shopping_items').update({ qty }).eq('id', it.id));
+  },
+  async setListDone(it, done) {
+    await q(sb.from('shopping_items').update({ done }).eq('id', it.id));
+  },
+  async removeList(ids) {
+    if (ids.length) await q(sb.from('shopping_items').delete().in('id', ids));
+  },
+  async listToCart(items, products, user) {
+    let known = products.slice();
+    for (const it of items) {
+      let p = (it.product_id && known.find(x => x.id === it.product_id))
+        || known.find(x => x.name.toLowerCase() === it.name.toLowerCase());
+      if (!p) {
+        p = await api.createProduct(it.name, guessCategory({ name: it.name, tags: [] }));
+        known = [...known, p];
+      }
+      await api.addTo(p, null, null, user, it.qty);
+    }
+    await api.removeList(items.map(i => i.id));
+  },
   async addTo(product, loc, _items, user, qty = 1) {
     // frisch aus der Datenbank lesen, damit schnelle Scans nichts verschlucken
     let qb = sb.from('stock').select('id,qty').eq('product_id', product.id)
@@ -587,6 +623,13 @@ function Home({ ctx }) {
 
       ${rest.length > 0 && html`<div class="grid2">${rest.map(tile)}</div>`}
 
+      <button class="tile small wide" onClick=${() => go({ name: 'list' })}>
+        <div class="list-icon">${Icon.list()}</div>
+        <div class="grow"><div class="tile-name">Einkaufsliste</div>
+          <div class="tile-sub">${ctx.shoppingOpen ? ctx.shoppingOpen + ' Artikel offen' : 'Nichts auf der Liste'}</div></div>
+        ${Icon.chevron()}
+      </button>
+
       <div class="grid2">
         <button class="tile small" onClick=${() => go({ name: 'all' })}>
           ${Icon.folder()}
@@ -717,7 +760,7 @@ function CartView({ ctx }) {
       <button class="src primary-src" onClick=${() => { primeAudio(); setScan(true); }}>${Icon.barcode()}Scannen</button>
       <button class="src" onClick=${() => soonFeature('Fotoerkennung')}>${Icon.camera()}Foto</button>
       <button class="src" onClick=${() => soonFeature('Kassenbon-Scan')}>${Icon.receipt()}Kassenbon</button>
-      <button class="src" onClick=${() => soonFeature('Einkaufsliste')}>${Icon.list()}Liste</button>
+      <button class="src" onClick=${() => ctx.go({ name: 'list' })}>${Icon.list()}Liste</button>
     </div>
     <${AddBox} ctx=${ctx} />
     ${cart.length > 0 && html`<div class="row-between">
@@ -763,6 +806,7 @@ function AllView({ ctx }) {
   const minus = ctx.act(async s => { await api.takeOut(s, 1, 'consumed', ctx.user); ctx.toast(`1× ${s.p.name} auf dem Teller`); });
   const plus = ctx.act(async s => { await api.setQty(s, s.qty + 1); });
   const toCart = ctx.act(async p => { await api.addTo(p, null, ctx.items, ctx.user); ctx.toast(`${p.name} → Einkaufswagen`); });
+  const toList = ctx.act(async p => { const n = await api.addToList(p, null, ctx.user); ctx.toast(`${p.name} · ${n}× auf der Einkaufsliste`); });
 
   return html`<main class="screen">
     <${Header} title="Gesamtbestand" sub=${`${sumQty(ctx.items.filter(s => s.loc))} Artikel an ${ctx.locations.length} Orten`} onBack=${() => ctx.go({ name: 'home' })} />
@@ -778,7 +822,7 @@ function AllView({ ctx }) {
           <div class="grow"><div class="item-name">${p.name}</div><div class="small muted">${catOf(p).name}</div></div>
           <div class="total">${sumQty(rows)}</div>
         </div>
-        ${rows.length === 0 ? html`<div class="row-between"><span class="muted small">Nicht vorrätig</span><button class="btn soft slim" onClick=${() => toCart(p)}>+ Wareneingang</button></div>`
+        ${rows.length === 0 ? html`<div class="row-between"><span class="muted small">Nicht vorrätig</span><div class="row"><button class="btn soft slim" onClick=${() => toList(p)}>+ Liste</button><button class="btn soft slim" onClick=${() => toCart(p)}>+ Wareneingang</button></div></div>`
           : rows.map(s => html`<div class="stock-row">
             <button class="row-btn grow" onClick=${() => ctx.open(s.id)}>
               <span><b>${s.qty}×</b> ${s.loc ? s.loc.name : 'Einkaufswagen'}${s.compartment ? ' · ' + s.compartment : ''}</span>
@@ -789,6 +833,105 @@ function AllView({ ctx }) {
           </div>`)}
       </div>`)}
     </div>
+  </main>`;
+}
+
+// ---------------------------------------------------------------------
+// Einkaufsliste
+// ---------------------------------------------------------------------
+function ListView({ ctx }) {
+  const [text, setText] = useState('');
+  const back = () => ctx.go({ name: 'home' });
+  if (ctx.shopping === null) return html`<main class="screen">
+    <${Header} title="Einkaufsliste" onBack=${back} />
+    <div class="card hint red">Für die Einkaufsliste fehlt noch das Datenbank-Update (update-phase2-einkaufsliste.sql in Supabase ausführen).</div>
+  </main>`;
+
+  const list = ctx.shopping.slice().sort((a, b) => a.created_at.localeCompare(b.created_at));
+  const open = list.filter(i => !i.done);
+  const done = list.filter(i => i.done);
+  const t = text.trim(), tl = t.toLowerCase();
+  const matches = tl ? ctx.products.filter(p => p.name.toLowerCase().includes(tl))
+    .sort((a, b) => (b.name.toLowerCase().startsWith(tl)) - (a.name.toLowerCase().startsWith(tl)) || a.name.localeCompare(b.name))
+    .slice(0, 6) : [];
+  const exact = ctx.products.some(p => p.name.toLowerCase() === tl);
+
+  const prod = it => ctx.products.find(p => p.id === it.product_id)
+    || { name: it.name, category: guessCategory({ name: it.name, tags: [] }) };
+  const stockText = it => {
+    if (!it.product_id) return null;
+    const byLoc = new Map();
+    ctx.items.filter(s => s.product_id === it.product_id).forEach(s => {
+      const n = s.loc ? s.loc.name : 'Einkaufswagen';
+      byLoc.set(n, (byLoc.get(n) || 0) + s.qty);
+    });
+    if (!byLoc.size) return null;
+    return 'Schon da: ' + [...byLoc].map(([n, c]) => `${c}× ${n}`).join(', ');
+  };
+
+  const add = ctx.act(async (p, name) => {
+    const n = await api.addToList(p, name, ctx.user);
+    ctx.toast(`${p ? p.name : name} · ${n}× auf der Liste`);
+    setText('');
+  });
+  const toggle = ctx.act(async it => { await api.setListDone(it, !it.done); });
+  const changeQty = ctx.act(async (it, d) => { await api.setListQty(it, it.qty + d); });
+  const remove = ctx.act(async it => { await api.removeList([it.id]); });
+  const transfer = ctx.act(async () => {
+    const n = done.length;
+    await api.listToCart(done, ctx.products, ctx.user);
+    ctx.toast(`${n} Artikel → Wareneingang. Jetzt dort einräumen.`);
+  });
+  const clearDone = ctx.act(async () => { await api.removeList(done.map(i => i.id)); });
+
+  const row = it => {
+    const st = stockText(it);
+    return html`<div class=${'list-row' + (it.done ? ' done' : '')}>
+      <label class="cart-check">
+        <input type="checkbox" checked=${it.done} onChange=${() => toggle(it)} aria-label=${it.name + (it.done ? ' wieder offen' : ' abhaken')} />
+        <${Thumb} product=${prod(it)} size=${32} />
+        <div class="cart-row-text">
+          <div class="item-name">${it.name}</div>
+          <div class=${'small ' + (st ? 'have' : 'muted')}>${st || 'nicht im Vorrat'}</div>
+        </div>
+      </label>
+      ${it.done
+        ? html`<b class="small">${it.qty}×</b>`
+        : html`<div class="stepper tight">
+            <button class="step sm" aria-label="weniger" disabled=${it.qty <= 1} onClick=${() => changeQty(it, -1)}>−</button>
+            <b>${it.qty}</b>
+            <button class="step sm" aria-label="mehr" onClick=${() => changeQty(it, 1)}>+</button>
+          </div>`}
+      <button class="icon-btn" aria-label=${it.name + ' entfernen'} onClick=${() => remove(it)}>✕</button>
+    </div>`;
+  };
+
+  return html`<main class=${'screen' + (done.length ? ' with-panel' : '')}>
+    <${Header} title="Einkaufsliste" sub=${`${open.length} offen · ${done.length} im Wagen`} onBack=${back} />
+    <div class="card addbox">
+      <label class="search inset">
+        ${Icon.search()}
+        <span class="sr">Artikel auf die Liste setzen</span>
+        <input type="text" placeholder="Was fehlt? z. B. Butter" value=${text} onInput=${e => setText(e.target.value)}
+          onKeyDown=${e => { if (e.key === 'Enter' && t) { e.preventDefault(); const m = ctx.products.find(p => p.name.toLowerCase() === tl); add(m || null, m ? null : t); } }} />
+      </label>
+      ${matches.length > 0 && html`<div class="suggest">
+        ${matches.map(p => html`<button class="suggest-btn" onClick=${() => add(p, null)}><${Thumb} product=${p} size=${26} /> ${p.name} <span class="plus">+1</span></button>`)}
+      </div>`}
+      ${t.length >= 2 && !exact && html`<button class="link pad" onClick=${() => add(null, t)}>„${t}" auf die Liste</button>`}
+    </div>
+
+    ${list.length === 0 && html`<div class="card empty"><b>Die Liste ist leer.</b><span class="muted">Oben eintippen – oder im Teller bzw. Gesamtbestand auf „+ Liste" tippen.</span></div>`}
+    <div class="stack">${open.map(row)}</div>
+
+    ${done.length > 0 && html`<div class="shelf-name">Im Wagen</div><div class="stack">${done.map(row)}</div>`}
+
+    ${done.length > 0 && html`<div class="panel">
+      <div class="stack tight">
+        <button class="btn primary big" onClick=${transfer}>${Icon.cart('#FFFFFF')} ${done.length} gekauft → Wareneingang</button>
+        <button class="link pad center" onClick=${clearDone}>Abgehakte nur von der Liste löschen</button>
+      </div>
+    </div>`}
   </main>`;
 }
 
@@ -810,6 +953,11 @@ function PlateView({ ctx }) {
     g.list.push(e);
   });
   const label = key => key === todayISO() ? 'Heute' : key === addDays(-1) ? 'Gestern' : fromISO(key).toLocaleDateString('de-DE', { weekday: 'long', day: 'numeric', month: 'long' });
+  const rebuy = ctx.act(async e => {
+    const p = ctx.products.find(x => x.id === e.product_id);
+    const n = await api.addToList(p || null, e.product_name, ctx.user);
+    ctx.toast(`${e.product_name} · ${n}× auf der Einkaufsliste`);
+  });
 
   return html`<main class="screen">
     <${Header} title="Teller" sub="Was wurde verbraucht – und was nicht?" onBack=${() => ctx.go({ name: 'home' })} />
@@ -827,6 +975,7 @@ function PlateView({ ctx }) {
             <span class=${'dot ' + (e.action === 'consumed' ? 'green' : 'red')}></span>
             <div class="grow"><b>${e.qty}× ${e.product_name}</b><div class="small muted">${e.action === 'consumed' ? 'verbraucht' : 'weggeworfen'} · ${e.location_name || ''}${e.user_email ? ' · ' + e.user_email.split('@')[0] : ''}</div></div>
             <span class="small muted">${new Date(e.created_at).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })}</span>
+            ${ctx.shopping !== null && html`<button class="btn soft slim" aria-label=${e.product_name + ' nachkaufen'} onClick=${() => rebuy(e)}>+ Liste</button>`}
           </div>`)}
         </div>
       </section>`)}
@@ -893,7 +1042,7 @@ function SettingsView({ ctx }) {
       ${ctx.locations.map((l, i) => html`<${LocationEditor} key=${l.id} ctx=${ctx} loc=${l} index=${i} />`)}
       <button class="btn soft" onClick=${add}>+ Lagerort hinzufügen</button>
     </div>
-    <p class="small muted center">Vorrat · Version 2 (Phase 2 · Scanner)</p>
+    <p class="small muted center">Vorrat · Version 3 (Phase 2 · Scanner + Einkaufsliste)</p>
   </main>`;
 }
 
@@ -979,6 +1128,7 @@ function ItemSheet({ ctx, id, close }) {
             <button class="btn blue" onClick=${() => setMode('move')}>Umlagern</button>
             <button class="btn danger" onClick=${() => run(() => api.takeOut(it, 1, 'discarded', ctx.user), `1× ${it.p.name} als weggeworfen erfasst`)}>Weg­geworfen</button>
           </div>
+          ${ctx.shopping !== null && html`<button class="btn soft" onClick=${() => run(() => api.addToList(it.p, null, ctx.user), `${it.p.name} steht auf der Einkaufsliste`)}>+ Nachkaufen (Einkaufsliste)</button>`}
         </div>`}
       </div>`}
     </div>
@@ -1001,15 +1151,16 @@ function Main({ session }) {
   const reload = useCallback(async () => {
     try {
       const since = new Date(); since.setDate(since.getDate() - 62);
-      const [locations, products, stock, events, barcodes] = await Promise.all([
+      const [locations, products, stock, events, barcodes, shopping] = await Promise.all([
         q(sb.from('locations').select('*').order('sort').order('created_at')),
         q(sb.from('products').select('*').order('name')),
         q(sb.from('stock').select('*')),
         q(sb.from('events').select('*').gte('created_at', since.toISOString()).order('created_at', { ascending: false }).limit(500)),
         // fehlt die Tabelle noch (Update nicht ausgeführt), läuft die App trotzdem
-        sb.from('product_barcodes').select('code,product_id').then(r => (r.error ? null : r.data))
+        sb.from('product_barcodes').select('code,product_id').then(r => (r.error ? null : r.data)),
+        sb.from('shopping_items').select('*').then(r => (r.error ? null : r.data))
       ]);
-      setData({ locations, products, stock, events, barcodes });
+      setData({ locations, products, stock, events, barcodes, shopping });
       setError('');
     } catch (e) {
       setError(e.message || String(e));
@@ -1055,6 +1206,7 @@ function Main({ session }) {
     return {
       ...data, items, todayConsumed, user, go, toast, reload, barcodeMap,
       barcodesMissing: data.barcodes === null,
+      shoppingOpen: (data.shopping || []).filter(i => !i.done).length,
       open: id => setSheet({ id }),
       act: fn => async (...args) => {
         try { const r = await fn(...args); await reload(); return r; }
@@ -1082,6 +1234,7 @@ function Main({ session }) {
   else if (route.name === 'all') view = html`<${AllView} ctx=${ctx} />`;
   else if (route.name === 'plate') view = html`<${PlateView} ctx=${ctx} />`;
   else if (route.name === 'settings') view = html`<${SettingsView} ctx=${ctx} />`;
+  else if (route.name === 'list') view = html`<${ListView} ctx=${ctx} />`;
   else view = html`<${Home} ctx=${ctx} />`;
 
   return html`${view}
