@@ -1,6 +1,7 @@
 import { html, render, useState, useEffect, useMemo, useRef, useCallback } from 'https://unpkg.com/htm@3.1.1/preact/standalone.module.js';
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
 import { SUPABASE_URL, SUPABASE_KEY } from './config.js';
+import { startScanner, cameraMessage, normalizeCode, validCode, lookupOFF, guessCategory, guessExisting, isLongLife, primeAudio, beep } from './scanner.js?v=2';
 
 const sb = createClient(SUPABASE_URL, SUPABASE_KEY, {
   auth: { persistSession: true, autoRefreshToken: true }
@@ -172,13 +173,23 @@ const api = {
   async remove(ids) {
     if (ids.length) await q(sb.from('stock').delete().in('id', ids));
   },
-  async createProduct(name, category) {
-    const rows = await q(sb.from('products').insert({ name, category, default_days: CAT[category].days }).select());
+  async createProduct(name, category, extra = {}) {
+    const rows = await q(sb.from('products').insert({ name, category, default_days: CAT[category].days, ...extra }).select());
     return rows[0];
   },
-  async addTo(product, loc, items, user, qty = 1) {
-    const existing = items.find(s => s.product_id === product.id && s.estimated && !s.opened_at
-      && (loc ? s.location_id === loc.id : !s.location_id) && s.added_at === todayISO());
+  async linkBarcode(code, productId, label) {
+    await q(sb.from('product_barcodes').upsert({ code, product_id: productId, label }, { onConflict: 'code' }));
+  },
+  async setImage(product, url) {
+    if (url && !product.image_url) await q(sb.from('products').update({ image_url: url }).eq('id', product.id));
+  },
+  async addTo(product, loc, _items, user, qty = 1) {
+    // frisch aus der Datenbank lesen, damit schnelle Scans nichts verschlucken
+    let qb = sb.from('stock').select('id,qty').eq('product_id', product.id)
+      .eq('estimated', true).is('opened_at', null).eq('added_at', todayISO());
+    qb = loc ? qb.eq('location_id', loc.id) : qb.is('location_id', null);
+    const rows = await q(qb.limit(1));
+    const existing = rows[0];
     if (existing) {
       await q(sb.from('stock').update({ qty: existing.qty + qty }).eq('id', existing.id));
       return existing.qty + qty;
@@ -235,7 +246,9 @@ const Pill = ({ item }) => {
   const p = pillFor(item);
   return html`<span class=${'pill ' + p.tone}>${item.opened_at ? 'offen · ' : ''}${p.text}</span>`;
 };
-const Thumb = ({ product, size = 36 }) => html`<div class="thumb" style=${`width:${size}px;height:${size}px;background:${catOf(product).tint}`}>${(product.name || '?').charAt(0).toUpperCase()}</div>`;
+const Thumb = ({ product, size = 36 }) => product.image_url
+  ? html`<div class="thumb img" style=${`width:${size}px;height:${size}px`}><img src=${product.image_url} alt="" loading="lazy" /></div>`
+  : html`<div class="thumb" style=${`width:${size}px;height:${size}px;background:${catOf(product).tint}`}>${(product.name || '?').charAt(0).toUpperCase()}</div>`;
 
 function Header({ title, sub, onBack, right }) {
   return html`<header class="head">
@@ -249,6 +262,202 @@ function Header({ title, sub, onBack, right }) {
 }
 
 const sumQty = list => list.reduce((a, s) => a + s.qty, 0);
+
+// ---------------------------------------------------------------------
+// Barcode-Scanner (Vollbild)
+//   mode "cart": jeder Scan landet im Einkaufswagen
+//   mode "find": ein Scan zeigt, wo der Artikel liegt
+// ---------------------------------------------------------------------
+function Scanner({ ctx, mode, close, onFound }) {
+  const videoRef = useRef(null);
+  const ctxRef = useRef(ctx); ctxRef.current = ctx;
+  const phaseRef = useRef('starting');
+  const seen = useRef({ code: '', t: 0 });
+  const queue = useRef(Promise.resolve());
+  const flashTimer = useRef(null);
+  const [phase, setPhaseState] = useState('starting');
+  const [camError, setCamError] = useState('');
+  const [session, setSession] = useState([]);
+  const [flash, setFlash] = useState('');
+  const [pending, setPending] = useState(null);
+  const [manual, setManual] = useState('');
+  const setPhase = p => { phaseRef.current = p; setPhaseState(p); };
+
+  const showFlash = msg => {
+    setFlash(msg);
+    clearTimeout(flashTimer.current);
+    flashTimer.current = setTimeout(() => setFlash(''), 2200);
+  };
+  const bump = product => setSession(list => {
+    const i = list.findIndex(x => x.product.id === product.id);
+    if (i < 0) return [{ product, count: 1 }, ...list];
+    const next = list.slice();
+    next[i] = { ...next[i], count: next[i].count + 1 };
+    return next;
+  });
+  const addKnown = product => {
+    queue.current = queue.current.then(async () => {
+      try {
+        await api.addTo(product, null, null, ctxRef.current.user);
+        bump(product);
+        showFlash(`${product.name} +1`);
+      } catch (e) { showFlash('Fehler: ' + (e.message || e)); }
+    });
+  };
+
+  const handleCode = async (raw, force) => {
+    const code = normalizeCode(raw);
+    if (!validCode(code)) { if (force) showFlash('Das ist keine gültige Barcode-Nummer.'); return; }
+    const now = Date.now();
+    const s = seen.current;
+    // derselbe Code zählt erst wieder, wenn er 2 Sekunden nicht mehr im Bild war
+    if (!force && s.code === code && now - s.t < 2000) { s.t = now; return; }
+    seen.current = { code, t: now };
+    if (phaseRef.current !== 'scan') return;
+    const c = ctxRef.current;
+    if (c.barcodesMissing) return;
+    beep();
+    const known = c.barcodeMap.get(code);
+    if (mode === 'find') { onFound(known || null, code); return; }
+    if (known) { addKnown(known); return; }
+
+    setPending({ code });
+    setPhase('lookup');
+    const off = await lookupOFF(code);
+    const info = off && !off.error ? off : null;
+    const matches = info ? guessExisting(info, c.products) : [];
+    let name = '';
+    if (info && info.name) {
+      name = info.brand && !info.name.toLowerCase().includes(info.brand.toLowerCase())
+        ? `${info.name} (${info.brand})` : info.name;
+    }
+    setPending({
+      code, info, offline: !!(off && off.error), matches,
+      choice: matches[0] ? matches[0].id : 'new',
+      name, cat: info ? guessCategory(info) : 'sonstiges',
+      days: info && isLongLife(info) ? 90 : null
+    });
+    setPhase('confirm');
+  };
+
+  const confirm = async () => {
+    const p = pending;
+    const c = ctxRef.current;
+    setPhase('saving');
+    try {
+      let product;
+      if (p.choice !== 'new') {
+        product = c.products.find(x => x.id === p.choice);
+      } else {
+        const name = p.name.trim();
+        product = c.products.find(x => x.name.toLowerCase() === name.toLowerCase());
+        if (!product) {
+          const extra = { image_url: p.info && p.info.image ? p.info.image : null };
+          if (p.days) extra.default_days = p.days;
+          product = await api.createProduct(name, p.cat, extra);
+        }
+      }
+      const label = p.info ? [p.info.name, p.info.brand].filter(Boolean).join(' · ') || null : null;
+      await api.linkBarcode(p.code, product.id, label);
+      if (p.info && p.info.image) await api.setImage(product, p.info.image);
+      await api.addTo(product, null, null, c.user);
+      bump(product);
+      showFlash(`${product.name} +1 · Barcode gemerkt`);
+      await c.reload();
+    } catch (e) {
+      showFlash('Fehler: ' + (e.message || e));
+    }
+    seen.current = { code: p.code, t: Date.now() };
+    setPending(null);
+    setPhase('scan');
+  };
+
+  const cancelPending = () => {
+    if (pending) seen.current = { code: pending.code, t: Date.now() };
+    setPending(null);
+    setPhase('scan');
+  };
+
+  useEffect(() => {
+    let handle = null, dead = false;
+    primeAudio();
+    if (ctxRef.current.barcodesMissing) {
+      setCamError('Für den Scanner fehlt noch das Datenbank-Update (update-phase2-scanner.sql in Supabase ausführen).');
+      setPhase('scan');
+      return;
+    }
+    startScanner(videoRef.current, code => handleCode(code))
+      .then(h => { if (dead) h.stop(); else { handle = h; setPhase('scan'); } })
+      .catch(e => { if (!dead) { setCamError(cameraMessage(e)); setPhase('scan'); } });
+    return () => { dead = true; clearTimeout(flashTimer.current); if (handle) handle.stop(); };
+  }, []);
+
+  const total = session.reduce((a, s) => a + s.count, 0);
+  const info = pending && pending.info;
+
+  return html`<div class="scanner" role="dialog" aria-label="Barcode scannen">
+    <video ref=${videoRef} class="scan-video" playsinline muted autoplay></video>
+    <div class="scan-top">
+      <button class="scan-close" onClick=${close}>✕ Schließen</button>
+      <span class="scan-title">${mode === 'find' ? 'Suchen per Barcode' : 'Einkauf scannen'}</span>
+    </div>
+    ${!camError && html`<div class="scan-frame"><span>${phase === 'starting' ? 'Kamera startet …' : 'Barcode in den Rahmen halten'}</span></div>`}
+    ${flash && html`<div class="scan-flash" role="status">${flash}</div>`}
+
+    <div class="scan-panel">
+      ${camError && html`<div class="hint red">${camError}</div>`}
+
+      ${phase === 'lookup' && pending && html`<div class="row"><div class="spinner" aria-hidden="true"></div><b>Suche Produkt ${pending.code} …</b></div>`}
+
+      ${(phase === 'confirm' || phase === 'saving') && pending && html`<div class="stack">
+        <div class="row">
+          ${info && info.image
+            ? html`<img class="off-img" src=${info.image} alt="" />`
+            : html`<div class="thumb" style="width:52px;height:52px;background:#ECEAE3">?</div>`}
+          <div class="grow">
+            <b>${info ? (info.name || 'Produkt ohne Namen') : 'Unbekanntes Produkt'}</b>
+            <div class="small muted">${info ? [info.brand, info.quantity].filter(Boolean).join(' · ') || 'Barcode ' + pending.code : 'Barcode ' + pending.code}</div>
+          </div>
+        </div>
+        ${!info && html`<div class="small muted">${pending.offline ? 'Keine Verbindung zur Produktdatenbank. ' : 'In der Produktdatenbank nicht gefunden. '}Gib dem Artikel einen Namen – beim nächsten Scan erkennt die App ihn sofort.</div>`}
+        <div class="small muted">Speichern als</div>
+        <div class="chips">
+          ${pending.matches.map(m => html`<button class=${'chip' + (pending.choice === m.id ? ' on' : '')} onClick=${() => setPending({ ...pending, choice: m.id })}>${m.name}</button>`)}
+          <button class=${'chip' + (pending.choice === 'new' ? ' on' : '')} onClick=${() => setPending({ ...pending, choice: 'new' })}>Neuer Artikel</button>
+        </div>
+        ${pending.choice === 'new' && html`<div class="stack tight">
+          <input class="date" value=${pending.name} placeholder="Name, z. B. Vollmilch" aria-label="Name des Artikels"
+            onInput=${e => setPending({ ...pending, name: e.target.value })} />
+          <div class="chips">${CATS.map(cat => html`<button class=${'chip' + (pending.cat === cat.key ? ' on' : '')}
+            style=${pending.cat === cat.key ? '' : `background:${cat.tint}`}
+            onClick=${() => setPending({ ...pending, cat: cat.key })}>${cat.name}</button>`)}</div>
+        </div>`}
+        <div class="grid2 tight">
+          <button class="btn" onClick=${cancelPending}>Abbrechen</button>
+          <button class="btn primary" disabled=${phase === 'saving' || (pending.choice === 'new' && !pending.name.trim())} onClick=${confirm}>
+            ${phase === 'saving' ? 'Speichere …' : 'In den Wagen'}
+          </button>
+        </div>
+      </div>`}
+
+      ${(phase === 'scan' || phase === 'starting') && html`<div class="stack">
+        ${session.length === 0
+          ? html`<div class="small muted center">${mode === 'find' ? 'Scanne ein Produkt, um zu sehen, wo es liegt.' : 'Gescannte Artikel landen direkt im Einkaufswagen. Gleiche Artikel: kurz aus dem Bild nehmen und neu scannen – oder unten auf + tippen.'}</div>`
+          : html`<div class="scan-list">${session.map(s => html`<div class="scan-item">
+              <${Thumb} product=${s.product} size=${34} />
+              <div class="grow item-name">${s.product.name}</div>
+              <b>${s.count}×</b>
+              <button class="step" aria-label=${'Noch 1× ' + s.product.name} onClick=${() => addKnown(s.product)}>+</button>
+            </div>`)}</div>`}
+        <form class="row" onSubmit=${e => { e.preventDefault(); if (manual.trim()) { handleCode(manual, true); setManual(''); } }}>
+          <input class="date" inputmode="numeric" placeholder="Code eintippen" aria-label="Barcode-Nummer" value=${manual} onInput=${e => setManual(e.target.value)} />
+          <button class="btn soft slim">Suchen</button>
+        </form>
+        ${mode === 'cart' && html`<button class="btn primary" onClick=${close}>Fertig${total ? ` · ${total} Artikel gescannt` : ''}</button>`}
+      </div>`}
+    </div>
+  </div>`;
+}
 
 // ---------------------------------------------------------------------
 // Login
@@ -290,6 +499,14 @@ function Login() {
 function Home({ ctx }) {
   const { locations, items, go, open, toast } = ctx;
   const [query, setQuery] = useState('');
+  const [scan, setScan] = useState(false);
+  const onFound = p => {
+    setScan(false);
+    if (!p) { toast('Diesen Barcode kennt die App noch nicht. Scanne ihn einmal im Wareneingang ein.'); return; }
+    const rows = items.filter(s => s.product_id === p.id);
+    if (rows.length === 1) open(rows[0].id);
+    else setQuery(p.name);
+  };
   const placed = items.filter(s => s.loc);
   const cart = items.filter(s => !s.loc);
   const soon = placed.filter(isSoon).sort((a, b) => a.best_before.localeCompare(b.best_before));
@@ -332,7 +549,9 @@ function Home({ ctx }) {
       ${Icon.search()}
       <span class="sr">Vorrat durchsuchen</span>
       <input type="search" placeholder="Wo ist … z. B. Erdnussbutter" value=${query} onInput=${e => setQuery(e.target.value)} />
+      <button type="button" class="scan-btn" aria-label="Per Barcode suchen" onClick=${() => { primeAudio(); setScan(true); }}>${Icon.barcode()}</button>
     </label>
+    ${scan && html`<${Scanner} ctx=${ctx} mode="find" close=${() => setScan(false)} onFound=${onFound} />`}
 
     ${ql ? html`<section class="stack">
       ${results.length === 0 && html`<div class="card muted">Nichts gefunden.</div>`}
@@ -474,6 +693,7 @@ function AddBox({ ctx }) {
 function CartView({ ctx }) {
   const cart = ctx.items.filter(s => !s.loc).sort((a, b) => a.p.name.localeCompare(b.p.name));
   const [sel, setSel] = useState({});
+  const [scan, setScan] = useState(false);
   const selected = cart.filter(s => sel[s.id]);
   const allChecked = cart.length > 0 && selected.length === cart.length;
   const toggle = id => setSel(prev => { const n = { ...prev }; if (n[id]) delete n[id]; else n[id] = true; return n; });
@@ -494,7 +714,7 @@ function CartView({ ctx }) {
   return html`<main class=${'screen' + (selected.length ? ' with-panel' : '')}>
     <${Header} title="Wareneingang" sub=${cart.length + ' Artikel im Einkaufswagen'} onBack=${() => ctx.go({ name: 'home' })} />
     <div class="grid4">
-      <button class="src" onClick=${() => soonFeature('Barcode-Scan')}>${Icon.barcode()}Barcode</button>
+      <button class="src primary-src" onClick=${() => { primeAudio(); setScan(true); }}>${Icon.barcode()}Scannen</button>
       <button class="src" onClick=${() => soonFeature('Fotoerkennung')}>${Icon.camera()}Foto</button>
       <button class="src" onClick=${() => soonFeature('Kassenbon-Scan')}>${Icon.receipt()}Kassenbon</button>
       <button class="src" onClick=${() => soonFeature('Einkaufsliste')}>${Icon.list()}Liste</button>
@@ -524,6 +744,7 @@ function CartView({ ctx }) {
         <button class="btn danger" onClick=${trash}>${Icon.trash()} Müll</button>
       </div>
     </div>`}
+    ${scan && html`<${Scanner} ctx=${ctx} mode="cart" close=${() => setScan(false)} />`}
   </main>`;
 }
 
@@ -672,7 +893,7 @@ function SettingsView({ ctx }) {
       ${ctx.locations.map((l, i) => html`<${LocationEditor} key=${l.id} ctx=${ctx} loc=${l} index=${i} />`)}
       <button class="btn soft" onClick=${add}>+ Lagerort hinzufügen</button>
     </div>
-    <p class="small muted center">Vorrat · Version 1 (Phase 1)</p>
+    <p class="small muted center">Vorrat · Version 2 (Phase 2 · Scanner)</p>
   </main>`;
 }
 
@@ -780,13 +1001,15 @@ function Main({ session }) {
   const reload = useCallback(async () => {
     try {
       const since = new Date(); since.setDate(since.getDate() - 62);
-      const [locations, products, stock, events] = await Promise.all([
+      const [locations, products, stock, events, barcodes] = await Promise.all([
         q(sb.from('locations').select('*').order('sort').order('created_at')),
         q(sb.from('products').select('*').order('name')),
         q(sb.from('stock').select('*')),
-        q(sb.from('events').select('*').gte('created_at', since.toISOString()).order('created_at', { ascending: false }).limit(500))
+        q(sb.from('events').select('*').gte('created_at', since.toISOString()).order('created_at', { ascending: false }).limit(500)),
+        // fehlt die Tabelle noch (Update nicht ausgeführt), läuft die App trotzdem
+        sb.from('product_barcodes').select('code,product_id').then(r => (r.error ? null : r.data))
       ]);
-      setData({ locations, products, stock, events });
+      setData({ locations, products, stock, events, barcodes });
       setError('');
     } catch (e) {
       setError(e.message || String(e));
@@ -827,8 +1050,11 @@ function Main({ session }) {
     }));
     const t = todayISO();
     const todayConsumed = data.events.filter(e => e.action === 'consumed' && toISO(new Date(e.created_at)) === t).reduce((a, e) => a + e.qty, 0);
+    const barcodeMap = new Map();
+    (data.barcodes || []).forEach(b => { const p = pmap.get(b.product_id); if (p) barcodeMap.set(b.code, p); });
     return {
-      ...data, items, todayConsumed, user, go, toast,
+      ...data, items, todayConsumed, user, go, toast, reload, barcodeMap,
+      barcodesMissing: data.barcodes === null,
       open: id => setSheet({ id }),
       act: fn => async (...args) => {
         try { const r = await fn(...args); await reload(); return r; }
