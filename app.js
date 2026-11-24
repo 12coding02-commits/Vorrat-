@@ -1,11 +1,14 @@
 import { html, render, useState, useEffect, useMemo, useRef, useCallback } from 'https://unpkg.com/htm@3.1.1/preact/standalone.module.js';
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
-import { SUPABASE_URL, SUPABASE_KEY } from './config.js';
+import { SUPABASE_URL, SUPABASE_KEY, VAPID_PUBLIC_KEY } from './config.js?v=4';
 import { startScanner, cameraMessage, normalizeCode, validCode, lookupOFF, guessCategory, guessExisting, isLongLife, primeAudio, beep } from './scanner.js?v=2';
 
 const sb = createClient(SUPABASE_URL, SUPABASE_KEY, {
   auth: { persistSession: true, autoRefreshToken: true }
 });
+
+const APP_VERSION = '4';
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
 
 // ---------------------------------------------------------------------
 // Kategorien: Haltbarkeit in Tagen (ab Einkauf), im Gefrierfach,
@@ -1028,6 +1031,94 @@ function LocationEditor({ ctx, loc, index }) {
   </div>`;
 }
 
+function urlB64ToUint8Array(b64) {
+  const pad = '='.repeat((4 - (b64.length % 4)) % 4);
+  const raw = atob((b64 + pad).replace(/-/g, '+').replace(/_/g, '/'));
+  return Uint8Array.from(raw, c => c.charCodeAt(0));
+}
+const swReady = () => Promise.race([
+  navigator.serviceWorker.ready,
+  new Promise((_, reject) => setTimeout(() => reject(new Error('Hintergrund-Helfer nicht bereit – App neu öffnen.')), 6000))
+]);
+
+function PushCard({ ctx }) {
+  const supported = 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+  const standalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+  const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent);
+  const [state, setState] = useState('loading');
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      if (!supported) return setState('unsupported');
+      if (Notification.permission === 'denied') return setState('denied');
+      try {
+        const reg = await swReady();
+        setState((await reg.pushManager.getSubscription()) ? 'on' : 'off');
+      } catch (e) { setState('off'); }
+    })();
+  }, []);
+
+  const enable = async () => {
+    setBusy(true);
+    try {
+      const perm = await Notification.requestPermission();
+      if (perm !== 'granted') { setState(perm === 'denied' ? 'denied' : 'off'); return; }
+      const reg = await swReady();
+      const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64ToUint8Array(VAPID_PUBLIC_KEY) });
+      const j = sub.toJSON();
+      await q(sb.from('push_subscriptions').upsert(
+        { endpoint: j.endpoint, p256dh: j.keys.p256dh, auth: j.keys.auth, user_email: ctx.user.toLowerCase() },
+        { onConflict: 'endpoint' }));
+      setState('on');
+      ctx.toast('Erinnerungen sind eingeschaltet.');
+    } catch (e) { ctx.toast('Fehler: ' + (e.message || e)); }
+    finally { setBusy(false); }
+  };
+  const disable = async () => {
+    setBusy(true);
+    try {
+      const reg = await swReady();
+      const sub = await reg.pushManager.getSubscription();
+      if (sub) {
+        await q(sb.from('push_subscriptions').delete().eq('endpoint', sub.endpoint));
+        await sub.unsubscribe();
+      }
+      setState('off');
+      ctx.toast('Erinnerungen auf diesem Gerät ausgeschaltet.');
+    } catch (e) { ctx.toast('Fehler: ' + (e.message || e)); }
+    finally { setBusy(false); }
+  };
+  const test = async () => {
+    setBusy(true);
+    try {
+      const { data, error } = await sb.functions.invoke('erinnerung', { body: { test: true } });
+      if (error) throw error;
+      ctx.toast(data && data.sent ? 'Test gesendet – die Nachricht kommt gleich.' : 'Kein Gerät gefunden. Erst einschalten.');
+    } catch (e) { ctx.toast('Test fehlgeschlagen: ' + (e.message || e)); }
+    finally { setBusy(false); }
+  };
+
+  return html`<div class="card stack">
+    <div><b>Erinnerungen</b><div class="small muted">Täglich um 6:45 und 15:00 Uhr: alles, was in den nächsten 2 Tagen abläuft.</div></div>
+    ${state === 'unsupported' || (isIOS && !standalone)
+      ? html`<div class="hint">Öffne die App über das Symbol auf dem Home-Bildschirm (iPhone ab iOS 16.4), dann kannst du Erinnerungen hier einschalten.</div>`
+      : state === 'denied'
+        ? html`<div class="hint red">Benachrichtigungen sind blockiert. iPhone: Einstellungen → Mitteilungen → Vorrat → „Mitteilungen erlauben“.</div>`
+        : state === 'loading'
+          ? html`<div class="small muted">Prüfe …</div>`
+          : state === 'on'
+            ? html`<div class="stack tight">
+                <div class="small have">Auf diesem Gerät eingeschaltet.</div>
+                <div class="grid2 tight">
+                  <button class="btn soft" disabled=${busy} onClick=${test}>Test senden</button>
+                  <button class="btn" disabled=${busy} onClick=${disable}>Ausschalten</button>
+                </div>
+              </div>`
+            : html`<button class="btn primary" disabled=${busy} onClick=${enable}>Erinnerungen einschalten</button>`}
+  </div>`;
+}
+
 function SettingsView({ ctx }) {
   const add = ctx.act(async () => { await api.addLocation(ctx.locations.length + 1); });
 
@@ -1037,12 +1128,13 @@ function SettingsView({ ctx }) {
       <div><div class="small muted">Angemeldet als</div><b>${ctx.user}</b></div>
       <button class="btn soft slim" onClick=${() => sb.auth.signOut()}>Abmelden</button>
     </div>
+    <${PushCard} ctx=${ctx} />
     <div class="shelf-name">Lagerorte</div>
     <div class="stack">
       ${ctx.locations.map((l, i) => html`<${LocationEditor} key=${l.id} ctx=${ctx} loc=${l} index=${i} />`)}
       <button class="btn soft" onClick=${add}>+ Lagerort hinzufügen</button>
     </div>
-    <p class="small muted center">Vorrat · Version 3 (Phase 2 · Scanner + Einkaufsliste)</p>
+    <p class="small muted center">Vorrat · Version ${APP_VERSION} (Phase 2 komplett)</p>
   </main>`;
 }
 
@@ -1144,6 +1236,23 @@ function Main({ session }) {
   const [route, setRoute] = useState({ name: 'home' });
   const [sheet, setSheet] = useState(null);
   const [toastMsg, setToastMsg] = useState('');
+  const [newVersion, setNewVersion] = useState(false);
+
+  // Versionsprüfung: Gibt es eine neuere App-Version auf GitHub?
+  useEffect(() => {
+    const check = async () => {
+      try {
+        const r = await fetch('version.json?t=' + Date.now(), { cache: 'no-store' });
+        const j = await r.json();
+        if (j.version && String(j.version) !== APP_VERSION) setNewVersion(true);
+      } catch (e) { /* offline – später nochmal */ }
+    };
+    check();
+    const timer = setInterval(check, 30 * 60 * 1000);
+    const onVis = () => { if (document.visibilityState === 'visible') check(); };
+    document.addEventListener('visibilitychange', onVis);
+    return () => { clearInterval(timer); document.removeEventListener('visibilitychange', onVis); };
+  }, []);
   const toastTimer = useRef(null);
   const reloadTimer = useRef(null);
   const user = session.user.email;
@@ -1239,7 +1348,8 @@ function Main({ session }) {
 
   return html`${view}
     ${sheet && html`<${ItemSheet} key=${sheet.id} ctx=${ctx} id=${sheet.id} close=${() => setSheet(null)} />`}
-    ${toastMsg && html`<div class="toast" role="status">${toastMsg}</div>`}`;
+    ${toastMsg && html`<div class="toast" role="status">${toastMsg}</div>`}
+    ${newVersion && html`<button class="update-banner" onClick=${() => location.reload()}>Neue Version verfügbar – tippen zum Aktualisieren</button>`}`;
 }
 
 function App() {
